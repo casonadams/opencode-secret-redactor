@@ -114,5 +114,14 @@ export const SecretRedactor: Plugin = async ({ client }) => {
   };
 };
 
-// OpenCode resolves npm plugins via the default export
-export default SecretRedactor;
+// OpenCode resolves npm plugins via the default export. The object form
+// ({ id, server }) is required: it is picked up by the loader's readV1Plugin
+// path and avoids getLegacyPlugins, which throws "Plugin export is not a
+// function" on CJS builds that expose non-function exports alongside the
+// plugin (see getLegacyPlugins in packages/opencode/src/plugin/index.ts).
+export const secretRedactorPlugin = {
+  id: "opencode-secret-redactor",
+  server: SecretRedactor,
+};
+
+export default secretRedactorPlugin;

@@ -12,6 +12,11 @@
       "import": "./dist/plugin.js",
       "require": "./dist/plugin.cjs"
     },
+    "./server": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js",
+      "require": "./dist/plugin.cjs"
+    },
     "./lib": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
