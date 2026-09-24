@@ -193,6 +193,31 @@ describe("detectSecrets", () => {
     expect(results[0].label).toMatch(/^credit_card_/);
   });
 
+  // -- Regression: credit_card false positive on long digit runs --
+  it("does not detect the SolarEdge float32-max sentinel as a credit card", () => {
+    const results = detectSecrets(
+      "export_control_site_limit: -340282346638528859811704183484516925440",
+    );
+
+    const creditCardMatch = results.find((r) => r.label.startsWith("credit_card"));
+    expect(creditCardMatch).toBeUndefined();
+  });
+
+  it("does not detect non-Luhn digit windows as credit cards", () => {
+    const results = detectSecrets("3402823466385288");
+    const creditCardMatch = results.find((r) => r.label.startsWith("credit_card"));
+    expect(creditCardMatch).toBeUndefined();
+  });
+
+  it("still detects Luhn-valid card-shaped numbers even when isolated", () => {
+    // 418348451692544 is a Luhn-valid 15-digit window of the SolarEdge
+    // sentinel; it is indistinguishable from a real card and must remain
+    // detectable when isolated.
+    const results = detectSecrets("418348451692544");
+    const creditCardMatch = results.find((r) => r.label.startsWith("credit_card"));
+    expect(creditCardMatch).toBeDefined();
+  });
+
   it("detects a US SSN", () => {
     const results = detectSecrets("ssn is 123-45-6789");
 
