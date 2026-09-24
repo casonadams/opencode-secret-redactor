@@ -1,4 +1,5 @@
 import { MIN_SECRET_LENGTH } from "./config.js";
+import { isLuhnValid } from "./luhn.js";
 import { PATTERNS, type SecretPattern } from "./patterns.js";
 
 export interface DetectedSecret {
@@ -18,7 +19,12 @@ export function detectSecrets(
     let match = regex.exec(text);
     while (match !== null) {
       const value = match[1] ?? match[0];
-      if (!seen.has(value) && value.length >= MIN_SECRET_LENGTH) {
+      const isCreditCard = label === "credit_card";
+      if (
+        !seen.has(value) &&
+        value.length >= MIN_SECRET_LENGTH &&
+        (!isCreditCard || isLuhnValid(value))
+      ) {
         seen.add(value);
         found.push({ label: `${label}_${seen.size}`, value });
       }
