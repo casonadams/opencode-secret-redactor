@@ -1,6 +1,6 @@
 {
   "name": "opencode-secret-redactor",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "OpenCode plugin that redacts secrets from LLM context and restores them for tool execution",
   "type": "module",
   "main": "./dist/plugin.cjs",
@@ -16,6 +16,16 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js",
+      "require": "./dist/tui.cjs"
+    },
+    "./rpc": {
+      "types": "./dist/rpc.d.ts",
+      "import": "./dist/rpc.js",
+      "require": "./dist/rpc.cjs"
     }
   },
   "files": [
@@ -48,13 +58,23 @@
     "url": "https://github.com/casonadams/opencode-secret-redactor"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode-ai/plugin": ">=1.18.29",
+    "@opencode/plugin": ">=2.0.18"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.9",
     "@opencode-ai/plugin": "latest",
+    "@opencode/plugin": "2.0.18",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    },
+    "@opencode/plugin": {
+      "optional": true
+    }
   }
 }
