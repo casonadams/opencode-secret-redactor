@@ -1,218 +1,204 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SecretRedactor } from "./plugin.js";
 
-function createMockClient() {
-  return {
-    tui: {
-      showToast: vi.fn().mockResolvedValue(true),
-    },
-  };
+// Fake but well-formed values so the built-in patterns match them.
+const GITHUB_PAT = `ghp_${"a".repeat(36)}`;
+const JWT = `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.${"b".repeat(24)}`;
+
+const tempDirs: string[] = [];
+
+function makeDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
 }
 
-describe("SecretRedactor plugin", () => {
-  it("initializes and returns hook handlers", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
+function writeProjectConfig(project: string, config: unknown): void {
+  mkdirSync(join(project, ".opencode"), { recursive: true });
+  writeFileSync(join(project, ".opencode", "secret-redactor.json"), JSON.stringify(config));
+}
 
-    expect(hooks).toHaveProperty("chat.message");
-    expect(hooks).toHaveProperty("experimental.chat.messages.transform");
-    expect(hooks).toHaveProperty("tool.execute.before");
-    expect(hooks).toHaveProperty("tool.execute.after");
+type Hook = (event: any) => Promise<void> | void;
+
+// Minimal stand-in for the OpenCode v2 plugin context: records every hook the
+// plugin registers so tests can invoke them directly.
+function createMockContext(directory?: string) {
+  const hooks = new Map<string, Hook>();
+  const register =
+    (domain: string) =>
+    async (name: string, callback: Hook): Promise<{ dispose: () => Promise<void> }> => {
+      hooks.set(`${domain}.${name}`, callback);
+      return { dispose: async () => void hooks.delete(`${domain}.${name}`) };
+    };
+  const ctx = {
+    location: { directory: directory ?? process.cwd() },
+    session: { hook: register("session") },
+    tool: { hook: register("tool") },
+  };
+  return { hooks, ctx };
+}
+
+async function loadHooks(directory?: string): Promise<Map<string, Hook>> {
+  const { hooks, ctx } = createMockContext(directory);
+  await SecretRedactor.setup(ctx as never);
+  return hooks;
+}
+
+// Keep tests independent from any real global opencode config file.
+beforeEach(() => {
+  vi.stubEnv("OPENCODE_CONFIG_DIR", makeDir("secret-redactor-global-"));
+  vi.stubEnv("SECRET_REDACTOR_CONFIG", "");
+  vi.stubEnv("SECRET_REDACTOR_ENABLE", "");
+  vi.stubEnv("SECRET_REDACTOR_DISABLE", "");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+afterAll(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("SecretRedactor plugin (v2)", () => {
+  it("registers hooks on the session and tool domains", async () => {
+    const hooks = await loadHooks();
+
+    expect([...hooks.keys()].sort()).toEqual([
+      "session.compaction",
+      "session.context",
+      "session.generate",
+      "session.prompt",
+      "session.title",
+      "tool.execute.after",
+      "tool.execute.before",
+    ]);
   });
 
-  it("redacts secrets in user chat message text parts", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const chatHook = hooks["chat.message"] as (
-      input: Record<string, unknown>,
-      output: { parts: Array<{ type: string; text?: string }> },
-    ) => Promise<void>;
+  it("redacts secrets in the prompt hook", async () => {
+    const hooks = await loadHooks();
+    const event = { prompt: { text: `my token is ${GITHUB_PAT}` } };
 
-    const parts = [
-      { type: "text", text: "my token is ghp_R8z3kL9mN2pQ5tV7wX0yB4dF6hJ1oS3uA8cE" },
-      { type: "file", mime: "image/png", url: "data:..." },
-    ];
+    await hooks.get("session.prompt")?.(event);
 
-    await chatHook({}, { parts } as never);
-
-    expect(parts[0].text).toMatch(/^my token is 🔒github_pat_\d+🔓$/);
-    expect(parts[1]).not.toHaveProperty("text");
+    expect(event.prompt.text).toMatch(/^my token is 🔒github_pat_\d+🔓$/);
   });
 
-  it("fires a toast when secrets are redacted in chat messages", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const chatHook = hooks["chat.message"] as (
-      input: Record<string, unknown>,
-      output: { parts: Array<{ type: string; text?: string }> },
-    ) => Promise<void>;
+  it("redacts text, tool-call input, tool-result value and system instructions", async () => {
+    const hooks = await loadHooks();
+    const event = {
+      messages: [
+        { content: [{ type: "text", text: `key ${GITHUB_PAT}` }] },
+        { content: [{ type: "tool-call", input: { command: `curl ${JWT}` } }] },
+        { content: [{ type: "tool-result", result: { value: `out ${JWT}` } }] },
+      ],
+      system: [{ text: `sys ${GITHUB_PAT}` }],
+    };
 
-    const parts = [{ type: "text", text: "my token is ghp_R8z3kL9mN2pQ5tV7wX0yB4dF6hJ1oS3uA8cE" }];
+    await hooks.get("session.context")?.(event);
 
-    await chatHook({}, { parts } as never);
-
-    expect(client.tui.showToast).toHaveBeenCalledWith({
-      body: {
-        message: expect.stringContaining("Redacted 1 secret(s) from chat"),
-        variant: "warning",
-      },
-    });
+    expect(event.messages[0].content[0].text).toMatch(/^key 🔒github_pat_\d+🔓$/);
+    expect(event.messages[1].content[0].input.command).toMatch(/^curl 🔒jwt_\d+🔓$/);
+    expect(event.messages[2].content[0].result.value).toMatch(/^out 🔒jwt_\d+🔓$/);
+    expect(event.system[0].text).toMatch(/^sys 🔒github_pat_\d+🔓$/);
   });
 
-  it("redacts JWT in bash tool output", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const afterHook = hooks["tool.execute.after"] as (
-      input: Record<string, unknown>,
-      output: Record<string, unknown>,
-    ) => Promise<void>;
+  it("redacts secrets in shell tool output", async () => {
+    const hooks = await loadHooks();
+    const event = { tool: "shell", status: "completed", result: { output: `token: ${JWT}` } };
 
-    const jwt =
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiZmFrZSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-    const output = { output: `token: ${jwt}` };
+    await hooks.get("tool.execute.after")?.(event);
 
-    await afterHook({ tool: "bash" }, output);
-
-    expect(output.output).toMatch(/^token: 🔒jwt_\d+🔓$/);
-  });
-
-  it("fires a toast when secrets are redacted in tool output", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const afterHook = hooks["tool.execute.after"] as (
-      input: Record<string, unknown>,
-      output: Record<string, unknown>,
-    ) => Promise<void>;
-
-    const jwt =
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiZmFrZSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-    await afterHook({ tool: "bash" }, { output: jwt });
-
-    expect(client.tui.showToast).toHaveBeenCalledWith({
-      body: {
-        message: expect.stringContaining("Redacted 1 secret(s) from bash"),
-        variant: "warning",
-      },
-    });
-  });
-
-  it("unredacts tokens in bash tool args before execution", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const afterHook = hooks["tool.execute.after"] as (
-      input: Record<string, unknown>,
-      output: Record<string, unknown>,
-    ) => Promise<void>;
-    const beforeHook = hooks["tool.execute.before"] as (
-      input: Record<string, unknown>,
-      output: Record<string, unknown>,
-    ) => Promise<void>;
-
-    // First redact a JWT via tool output
-    const jwt =
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiZmFrZSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-    const toolOutput = { output: jwt };
-    await afterHook({ tool: "bash" }, toolOutput);
-
-    // Extract the redacted label
-    const redactedToken = toolOutput.output as string;
-
-    // Then use the redacted token in a command
-    const args = { command: `curl -H 'Bearer ${redactedToken}'` };
-    await beforeHook({ tool: "bash" }, { args });
-
-    expect(args.command).toBe(`curl -H 'Bearer ${jwt}'`);
+    expect(event.result.output).toMatch(/^token: 🔒jwt_\d+🔓$/);
   });
 
   it("skips tools not in scope", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const afterHook = hooks["tool.execute.after"] as (
-      input: Record<string, unknown>,
-      output: Record<string, unknown>,
-    ) => Promise<void>;
+    const hooks = await loadHooks();
+    const event = { tool: "glob", status: "completed", result: { output: JWT } };
 
-    const jwt =
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiZmFrZSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-    const output = { output: jwt };
+    await hooks.get("tool.execute.after")?.(event);
 
-    await afterHook({ tool: "glob" }, output);
-
-    expect(output.output).toBe(jwt);
+    expect(event.result.output).toBe(JWT);
   });
 
-  it("handles null/undefined output gracefully", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const afterHook = hooks["tool.execute.after"] as (
-      input: Record<string, unknown>,
-      output: Record<string, unknown>,
-    ) => Promise<void>;
+  it("ignores failed tool executions", async () => {
+    const hooks = await loadHooks();
+    const event = { tool: "shell", status: "error", error: { message: JWT } };
 
-    await afterHook({ tool: "bash" }, { output: undefined });
-    await afterHook({ tool: "bash" }, { output: null });
+    await hooks.get("tool.execute.after")?.(event);
 
-    // Should not throw
-    expect(client.tui.showToast).not.toHaveBeenCalled();
+    expect(event.error.message).toBe(JWT);
   });
 
-  it("redacts secrets in experimental.chat.messages.transform", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const transformHook = hooks["experimental.chat.messages.transform"] as (
-      input: Record<string, unknown>,
-      output: {
-        messages: Array<{
-          info: Record<string, unknown>;
-          parts: Array<{ type: string; text?: string }>;
-        }>;
-      },
-    ) => Promise<void>;
+  it("restores secrets in tool arguments before execution", async () => {
+    const hooks = await loadHooks();
 
-    const messages = [
-      {
-        info: { role: "user" },
-        parts: [{ type: "text", text: "my key is ghp_R8z3kL9mN2pQ5tV7wX0yB4dF6hJ1oS3uA8cE" }],
-      },
-      {
-        info: { role: "assistant" },
-        parts: [{ type: "text", text: "no secrets here" }],
-      },
-    ];
+    const redacted = { tool: "shell", status: "completed", result: { output: JWT } };
+    await hooks.get("tool.execute.after")?.(redacted);
+    const token = redacted.result.output;
 
-    await transformHook({}, { messages } as never);
+    const args = { tool: "shell", input: { command: `curl -H 'Bearer ${token}'` } };
+    await hooks.get("tool.execute.before")?.(args);
 
-    expect(messages[0].parts[0].text).toMatch(/^my key is 🔒github_pat_\d+🔓$/);
-    expect(messages[1].parts[0].text).toBe("no secrets here");
+    expect(args.input.command).toBe(`curl -H 'Bearer ${JWT}'`);
   });
 
-  it("fires a toast when secrets are redacted in messages.transform", async () => {
-    const client = createMockClient();
-    const hooks = await SecretRedactor({ client } as never);
-    const transformHook = hooks["experimental.chat.messages.transform"] as (
-      input: Record<string, unknown>,
-      output: {
-        messages: Array<{
-          info: Record<string, unknown>;
-          parts: Array<{ type: string; text?: string }>;
-        }>;
-      },
-    ) => Promise<void>;
+  it("does not redact email addresses by default", async () => {
+    const hooks = await loadHooks();
+    const event = {
+      tool: "read",
+      status: "completed",
+      result: { output: "contact john.doe@example.com for info" },
+    };
 
-    const messages = [
-      {
-        info: { role: "user" },
-        parts: [{ type: "text", text: "ghp_R8z3kL9mN2pQ5tV7wX0yB4dF6hJ1oS3uA8cE" }],
-      },
-    ];
+    await hooks.get("tool.execute.after")?.(event);
 
-    await transformHook({}, { messages } as never);
+    expect(event.result.output).toBe("contact john.doe@example.com for info");
+  });
 
-    expect(client.tui.showToast).toHaveBeenCalledWith({
-      body: {
-        message: expect.stringContaining("Redacted 1 secret(s) from LLM context"),
-        variant: "warning",
-      },
-    });
+  it("redacts email addresses when the project config enables the pattern", async () => {
+    const project = makeDir("secret-redactor-project-");
+    writeProjectConfig(project, { enable: ["email"] });
+    const hooks = await loadHooks(project);
+    const event = {
+      tool: "read",
+      status: "completed",
+      result: { output: "contact john.doe@example.com for info" },
+    };
+
+    await hooks.get("tool.execute.after")?.(event);
+
+    expect(event.result.output).toMatch(/^contact 🔒email_\d+🔓 for info$/);
+  });
+
+  it("does not redact placeholder values such as ${DB_PASSWORD}", async () => {
+    const hooks = await loadHooks();
+    const event = {
+      tool: "read",
+      status: "completed",
+      result: { output: "password: ${DB_PASSWORD}" },
+    };
+
+    await hooks.get("tool.execute.after")?.(event);
+
+    expect(event.result.output).toBe("password: ${DB_PASSWORD}");
+  });
+
+  it("honours SECRET_REDACTOR_DISABLE from the environment", async () => {
+    vi.stubEnv("SECRET_REDACTOR_DISABLE", "github_pat");
+
+    const hooks = await loadHooks();
+    const event = {
+      tool: "shell",
+      status: "completed",
+      result: { output: `token: ${GITHUB_PAT}` },
+    };
+
+    await hooks.get("tool.execute.after")?.(event);
+
+    expect(event.result.output).toBe(`token: ${GITHUB_PAT}`);
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { detectSecrets } from "./detector.js";
+import { resolveConfig } from "./config.js";
+import { detectSecrets, isPlaceholder } from "./detector.js";
 
 describe("detectSecrets", () => {
   it("detects a JWT token", () => {
@@ -172,8 +173,15 @@ describe("detectSecrets", () => {
   });
 
   // -- PII --
-  it("detects an email address", () => {
+  it("does not detect email addresses by default", () => {
     const results = detectSecrets("contact john.doe@example.com for info");
+
+    expect(results).toHaveLength(0);
+  });
+
+  it("detects an email address when the email pattern is enabled", () => {
+    const { patterns, minLength } = resolveConfig({ enable: ["email"] });
+    const results = detectSecrets("contact john.doe@example.com for info", patterns, minLength);
 
     expect(results).toHaveLength(1);
     expect(results[0].label).toMatch(/^email_/);
@@ -226,5 +234,50 @@ describe("detectSecrets", () => {
     const results = detectSecrets("PASSWORD=short");
 
     expect(results).toHaveLength(0);
+  });
+
+  // -- Placeholders --
+  it.each([
+    "password=${DB_PASSWORD}",
+    "password={some_pass}",
+    "SECRET={{vault_password}}",
+    "API_KEY=$SERVICE_API_KEY",
+    "AUTH_TOKEN=%DEPLOY_TOKEN%",
+    "ACCESS_KEY=<<ACCESS_KEY>>",
+    "AUTH_TOKEN=__AUTH_TOKEN__",
+  ])("ignores the placeholder value in %s", (text) => {
+    const results = detectSecrets(text);
+
+    expect(results).toHaveLength(0);
+  });
+
+  it("still detects a literal secret next to a placeholder", () => {
+    const results = detectSecrets("PASSWORD=${DB_PASSWORD}\nPASSWORD=RealLiteralSecret123");
+
+    expect(results).toHaveLength(1);
+    expect(results[0].label).toMatch(/^env_secret_/);
+    expect(results[0].value).toBe("RealLiteralSecret123");
+  });
+
+  it.each([
+    "$PASS",
+    "${PASS}",
+    "{some_pass}",
+    "{{password}}",
+    "%DB_PASS%",
+    "<<PASS>>",
+    "$(PASS)",
+    "__SECRET__",
+    "${{ secrets.FOO }}",
+  ])("isPlaceholder(%s) is true", (value) => {
+    expect(isPlaceholder(value)).toBe(true);
+  });
+
+  it.each([
+    "SuperSecretPassword123",
+    "$2b$10$abcdefghijklmnopqrstuv",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  ])("isPlaceholder(%s) is false", (value) => {
+    expect(isPlaceholder(value)).toBe(false);
   });
 });

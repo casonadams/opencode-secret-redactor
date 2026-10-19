@@ -1,118 +1,152 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin as OpencodePlugin } from "@opencode/plugin";
 import type { RedactResult } from "./redactor.js";
 import type { SecretVault } from "./vault.js";
 
-interface TextPart {
-  type: "text";
-  text: string;
+type RedactDeep = (value: unknown, vault: SecretVault) => RedactResult;
+
+// Structural views of the model-request and tool-result shapes the hooks
+// receive. Structural (rather than imported) so the plugin carries no runtime
+// dependency on @opencode/plugin.
+interface RedactablePart {
+  type: string;
+  text?: string;
+  input?: unknown;
+  result?: { value?: unknown };
 }
 
-function isTextPart(part: unknown): part is TextPart {
-  return typeof part === "object" && part !== null && (part as TextPart).type === "text";
+interface RedactableMessage {
+  content?: ReadonlyArray<RedactablePart>;
+}
+
+interface RedactableSystemPart {
+  text?: string;
+}
+
+interface RedactableRequest {
+  messages: ReadonlyArray<RedactableMessage>;
+  system: ReadonlyArray<RedactableSystemPart>;
+}
+
+interface RedactableToolResult {
+  output?: unknown;
+  content?: string | ReadonlyArray<RedactablePart>;
+  metadata?: unknown;
 }
 
 function isToolInScope(tool: string, tools: ReadonlyArray<string>): boolean {
   return tools.includes(tool);
 }
 
-function uniqueTypes(labels: ReadonlyArray<string>): string[] {
-  const types = new Set<string>();
-  for (const label of labels) {
-    types.add(label.replace(/_\d+$/, ""));
-  }
-  return Array.from(types);
-}
-
-function redactParts(
-  parts: Array<{ type: string; text?: string }>,
-  redactDeep: (value: unknown, vault: SecretVault) => RedactResult,
+function redactInto(
+  value: unknown,
+  redactDeep: RedactDeep,
   vault: SecretVault,
-): string[] {
-  const allLabels: string[] = [];
-  for (const part of parts) {
-    if (!isTextPart(part)) continue;
-    const result = redactDeep(part.text, vault);
-    part.text = result.value as string;
-    allLabels.push(...result.labels);
-  }
-  return allLabels;
+  labels: string[],
+): unknown {
+  const result = redactDeep(value, vault);
+  labels.push(...result.labels);
+  return result.value;
 }
 
-// Named export for programmatic consumers
-export const SecretRedactor: Plugin = async ({ client }) => {
-  const [
-    { REDACT_OUTPUT_TOOLS, UNREDACT_ARGS_TOOLS },
-    { redactDeep, unredactDeep },
-    { createVault },
-  ] = await Promise.all([import("./config.js"), import("./redactor.js"), import("./vault.js")]);
+function redactMessage(
+  message: RedactableMessage,
+  redactDeep: RedactDeep,
+  vault: SecretVault,
+  labels: string[],
+): void {
+  if (!Array.isArray(message.content)) return;
+  for (const part of message.content) {
+    if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
+      part.text = redactInto(part.text, redactDeep, vault, labels) as string;
+    } else if (part.type === "tool-call" && part.input !== undefined) {
+      part.input = redactInto(part.input, redactDeep, vault, labels);
+    } else if (part.type === "tool-result" && part.result) {
+      part.result.value = redactInto(part.result.value, redactDeep, vault, labels);
+    }
+  }
+}
 
-  const vault = createVault();
+// Redacts every model-visible string in an assembled request: text and
+// reasoning parts, tool-call inputs, tool results, and system instructions.
+function redactRequest(event: RedactableRequest, redactDeep: RedactDeep, vault: SecretVault): void {
+  const labels: string[] = [];
+  for (const message of event.messages) redactMessage(message, redactDeep, vault, labels);
+  for (const part of event.system) {
+    if (typeof part.text === "string") {
+      part.text = redactInto(part.text, redactDeep, vault, labels) as string;
+    }
+  }
+}
 
-  return {
-    "chat.message": async (_input, output) => {
-      const allLabels = redactParts(output.parts, redactDeep, vault);
+function redactToolResult(
+  result: RedactableToolResult,
+  redactDeep: RedactDeep,
+  vault: SecretVault,
+  labels: string[],
+): RedactableToolResult {
+  if (result.output !== undefined) {
+    result.output = redactInto(result.output, redactDeep, vault, labels);
+  }
+  if (typeof result.content === "string") {
+    result.content = redactInto(result.content, redactDeep, vault, labels) as string;
+  } else if (Array.isArray(result.content)) {
+    result.content = result.content.map((part) =>
+      part.type === "text" && typeof part.text === "string"
+        ? { ...part, text: redactInto(part.text, redactDeep, vault, labels) as string }
+        : part,
+    );
+  }
+  return result;
+}
 
-      if (allLabels.length > 0) {
-        const types = uniqueTypes(allLabels);
-        client.tui
-          .showToast({
-            body: {
-              message: `Redacted ${allLabels.length} secret(s) from chat: ${types.join(", ")}`,
-              variant: "warning",
-            },
-          })
-          .catch(() => {});
-      }
-    },
+// OpenCode v2 plugin: a default export with a stable `id` and a `setup(ctx)`
+// that registers hooks on the domains that own each operation.
+export const SecretRedactor: OpencodePlugin.Plugin = {
+  id: "opencode-secret-redactor",
+  async setup(ctx) {
+    const [
+      { REDACT_OUTPUT_TOOLS, UNREDACT_ARGS_TOOLS, configure, loadConfig },
+      { redactDeep, unredactDeep },
+      { createVault },
+    ] = await Promise.all([import("./config.js"), import("./redactor.js"), import("./vault.js")]);
 
-    "experimental.chat.messages.transform": async (_input, output) => {
-      let totalRedacted = 0;
-      for (const msg of output.messages) {
-        const labels = redactParts(msg.parts, redactDeep, vault);
-        totalRedacted += labels.length;
-      }
+    configure(loadConfig(ctx.location.directory));
+    const vault = createVault();
 
-      if (totalRedacted > 0) {
-        client.tui
-          .showToast({
-            body: {
-              message: `Redacted ${totalRedacted} secret(s) from LLM context`,
-              variant: "warning",
-            },
-          })
-          .catch(() => {});
-      }
-    },
+    // User prompt text is persisted, so redact at admission.
+    await ctx.session.hook("prompt", (event) => {
+      const result = redactDeep(event.prompt.text, vault);
+      event.prompt.text = result.value as string;
+    });
 
-    "tool.execute.before": async (input, output) => {
-      if (!isToolInScope(input.tool, UNREDACT_ARGS_TOOLS)) return;
+    // Redact everything a model request can carry. Register each kind so
+    // auxiliary requests (compaction, titles, transient generation) are covered
+    // too, not just the agent loop.
+    const redactRequestHook = (event: unknown) => {
+      redactRequest(event as RedactableRequest, redactDeep, vault);
+    };
+    await ctx.session.hook("context", redactRequestHook);
+    await ctx.session.hook("compaction", redactRequestHook);
+    await ctx.session.hook("generate", redactRequestHook);
+    await ctx.session.hook("title", redactRequestHook);
 
-      for (const key of Object.keys(output.args)) {
-        output.args[key] = unredactDeep(output.args[key], vault);
-      }
-    },
+    // Restore real values in tool arguments before execution.
+    await ctx.tool.hook("execute.before", (event) => {
+      if (!isToolInScope(event.tool, UNREDACT_ARGS_TOOLS)) return;
+      event.input = unredactDeep(event.input, vault);
+    });
 
-    "tool.execute.after": async (input, output) => {
-      if (!isToolInScope(input.tool, REDACT_OUTPUT_TOOLS)) return;
-      if (output.output === undefined || output.output === null) return;
+    // Redact tool output before it enters context.
+    await ctx.tool.hook("execute.after", (event) => {
+      if (event.status !== "completed") return;
+      if (!isToolInScope(event.tool, REDACT_OUTPUT_TOOLS)) return;
 
-      const result = redactDeep(output.output, vault);
-      output.output = result.value as string;
-
-      if (result.labels.length > 0) {
-        const types = uniqueTypes(result.labels);
-        client.tui
-          .showToast({
-            body: {
-              message: `Redacted ${result.labels.length} secret(s) from ${input.tool}: ${types.join(", ")}`,
-              variant: "warning",
-            },
-          })
-          .catch(() => {});
-      }
-    },
-  };
+      const labels: string[] = [];
+      const result = event.result as unknown as RedactableToolResult;
+      const next = redactToolResult({ ...result }, redactDeep, vault, labels);
+      if (labels.length > 0) event.result = next as unknown as typeof event.result;
+    });
+  },
 };
 
-// OpenCode resolves npm plugins via the default export
 export default SecretRedactor;

@@ -1,6 +1,9 @@
 export interface SecretPattern {
   readonly label: string;
   readonly pattern: RegExp;
+  // Absent means enabled by default. Patterns with `defaultEnabled: false`
+  // stay in the catalog but are only active when listed in config `enable`.
+  readonly defaultEnabled?: boolean;
 }
 
 // Ordered so more specific prefixes come before generic ones to prevent
@@ -122,7 +125,13 @@ export const PATTERNS: ReadonlyArray<SecretPattern> = [
     pattern: /ecdsa-sha2-nistp(?:256|384|521)\s+[A-Za-z0-9+/]{60,}={0,2}/g,
   },
   // -- PII --
-  { label: "email", pattern: /(?<![:/])[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g },
+  // Off by default: email addresses are everywhere in ordinary file reads
+  // (configs, catalogs, vendored code) and redacting them breaks workflows.
+  {
+    label: "email",
+    defaultEnabled: false,
+    pattern: /(?<![:/])[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+  },
   {
     label: "credit_card",
     pattern:
